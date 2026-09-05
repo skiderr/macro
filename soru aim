@@ -1,0 +1,324 @@
+-- ==================== SORU AUTO AIM MODULE ====================
+-- Fully standalone • Ready to paste into your project
+
+local SoruAutoAim = {}
+
+-- Services
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local CoreGui = game:GetService("CoreGui")
+
+local player = Players.LocalPlayer
+local camera = workspace.CurrentCamera
+local Mouse = player:GetMouse()
+
+-- ==================== SETTINGS ====================
+local Settings = {
+    Enabled = false,
+    Range = 300,
+    AimMode = "360",          -- "360" | "180" | "FOV"
+    FOVType = "V1",           -- "V1" = screen center | "V2" = mouse
+    FOVRadius = 100,
+    Priority = "Nearest",     -- "Nearest" | "Low HP" | "Looking At Me"
+    ShowFOV = false,
+}
+
+-- Internal
+local CurrentTarget = nil
+local PredictedPosition = nil
+local FOVFrame = nil
+local RenderConnection = nil
+
+-- ==================== HELPERS ====================
+local function getHRP(model)
+    return model and model:FindFirstChild("HumanoidRootPart")
+end
+
+local function getFOVCenter()
+    if Settings.FOVType == "V2" then
+        return UserInputService:GetMouseLocation()
+    end
+    return camera.ViewportSize / 2
+end
+
+local function isEnemy(targetPlayer)
+    if not targetPlayer or targetPlayer == player then return false end
+
+    -- Basic protection checks
+    local char = targetPlayer.Character
+    if not char then return false end
+    if char:GetAttribute("SafeZone") or char:GetAttribute("PvpDisabled") or char:FindFirstChildWhichIsA("ForceField") then
+        return false
+    end
+
+    local myTeam = player.Team
+    local targetTeam = targetPlayer.Team
+
+    if myTeam and targetTeam then
+        if myTeam.Name == "Pirates" and targetTeam.Name == "Marines" then return true end
+        if myTeam.Name == "Marines" and targetTeam.Name == "Pirates" then return true end
+        if myTeam.Name == "Pirates" and targetTeam.Name == "Pirates" then return true end -- can add ally check if needed
+        if myTeam.Name == "Marines" and targetTeam.Name == "Marines" then return false end
+    end
+
+    return true
+end
+
+local function isTargetValid(hrp, myHRP)
+    if not hrp or not myHRP then return false end
+
+    if Settings.AimMode == "180" then
+        local dir = (hrp.Position - myHRP.Position).Unit
+        if myHRP.CFrame.LookVector:Dot(dir) < 0 then
+            return false
+        end
+    elseif Settings.AimMode == "FOV" then
+        local screenPos, onScreen = camera:WorldToViewportPoint(hrp.Position)
+        if not onScreen then return false end
+        local center = getFOVCenter()
+        if (Vector2.new(screenPos.X, screenPos.Y) - center).Magnitude > Settings.FOVRadius then
+            return false
+        end
+    end
+
+    return true
+end
+
+local function getBestTarget(myHRP)
+    if not myHRP then return nil end
+
+    local valid = {}
+
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= player and isEnemy(plr) and plr.Character and plr.Character.Parent then
+            local hum = plr.Character:FindFirstChildWhichIsA("Humanoid")
+            local hrp = getHRP(plr.Character)
+
+            if hum and hum.Health > 0 and hrp and isTargetValid(hrp, myHRP) then
+                local dist = (hrp.Position - myHRP.Position).Magnitude
+                if dist <= Settings.Range then
+                    table.insert(valid, {
+                        HRP = hrp,
+                        Humanoid = hum,
+                        Distance = dist
+                    })
+                end
+            end
+        end
+    end
+
+    if #valid == 0 then return nil end
+
+    if Settings.AimMode == "360" or Settings.AimMode == "180" then
+        if Settings.Priority == "Nearest" then
+            table.sort(valid, function(a, b) return a.Distance < b.Distance end)
+        elseif Settings.Priority == "Low HP" then
+            table.sort(valid, function(a, b) return a.Humanoid.Health < b.Humanoid.Health end)
+        elseif Settings.Priority == "Looking At Me" then
+            table.sort(valid, function(a, b)
+                local dirA = (myHRP.Position - a.HRP.Position).Unit
+                local lookA = a.HRP.CFrame.LookVector
+                local dirB = (myHRP.Position - b.HRP.Position).Unit
+                local lookB = b.HRP.CFrame.LookVector
+                return lookA:Dot(dirA) > lookB:Dot(dirB)
+            end)
+        end
+    else
+        -- FOV mode → closest to FOV center
+        local center = getFOVCenter()
+        table.sort(valid, function(a, b)
+            local pA = camera:WorldToViewportPoint(a.HRP.Position)
+            local pB = camera:WorldToViewportPoint(b.HRP.Position)
+            return (Vector2.new(pA.X, pA.Y) - center).Magnitude < (Vector2.new(pB.X, pB.Y) - center).Magnitude
+        end)
+    end
+
+    return valid[1].HRP
+end
+
+-- ==================== FOV CIRCLE ====================
+local function createFOV()
+    if FOVFrame then return end
+
+    local ScreenGui = Instance.new("ScreenGui")
+    ScreenGui.Name = "SoruAutoAimFOV"
+    ScreenGui.ResetOnSpawn = false
+    ScreenGui.IgnoreGuiInset = true
+    ScreenGui.Parent = CoreGui
+
+    FOVFrame = Instance.new("Frame")
+    FOVFrame.Name = "FOVCircle"
+    FOVFrame.AnchorPoint = Vector2.new(0.5, 0.5)
+    FOVFrame.BackgroundTransparency = 1
+    FOVFrame.Visible = false
+    FOVFrame.Parent = ScreenGui
+
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = Color3.fromRGB(0, 255, 0)
+    stroke.Thickness = 2
+    stroke.Parent = FOVFrame
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(1, 0)
+    corner.Parent = FOVFrame
+end
+
+local function updateFOV()
+    if not FOVFrame then return end
+
+    if Settings.ShowFOV and Settings.Enabled then
+        local center = getFOVCenter()
+        FOVFrame.Position = UDim2.new(0, center.X, 0, center.Y)
+        FOVFrame.Size = UDim2.new(0, Settings.FOVRadius * 2, 0, Settings.FOVRadius * 2)
+        FOVFrame.Visible = true
+    else
+        FOVFrame.Visible = false
+    end
+end
+
+-- ==================== MAIN LOOP ====================
+local function startLoop()
+    if RenderConnection then return end
+
+    createFOV()
+
+    RenderConnection = RunService.RenderStepped:Connect(function()
+        updateFOV()
+
+        if not Settings.Enabled then
+            CurrentTarget = nil
+            PredictedPosition = nil
+            return
+        end
+
+        local myHRP = getHRP(player.Character)
+        local targetHRP = getBestTarget(myHRP)
+
+        if targetHRP then
+            CurrentTarget = targetHRP
+            PredictedPosition = targetHRP.Position
+        else
+            CurrentTarget = nil
+            PredictedPosition = nil
+        end
+    end)
+end
+
+local function stopLoop()
+    if RenderConnection then
+        RenderConnection:Disconnect()
+        RenderConnection = nil
+    end
+    CurrentTarget = nil
+    PredictedPosition = nil
+    if FOVFrame then
+        FOVFrame.Visible = false
+    end
+end
+
+-- ==================== HOOKS ====================
+local function installHooks()
+    local mt = getrawmetatable(game)
+    local oldNamecall = mt.__namecall
+    local oldIndex = mt.__index
+
+    setreadonly(mt, false)
+
+    mt.__namecall = newcclosure(function(self, ...)
+        local method = getnamecallmethod()
+        local args = {...}
+
+        -- Detect skill key "C" (Soru)
+        local skillKey = nil
+        for _, arg in ipairs(args) do
+            if type(arg) == "string" and arg == "C" then
+                skillKey = "C"
+                break
+            end
+        end
+
+        if Settings.Enabled and PredictedPosition and skillKey == "C" then
+            for i, arg in ipairs(args) do
+                if typeof(arg) == "Vector3" then
+                    args[i] = PredictedPosition
+                end
+            end
+        end
+
+        return oldNamecall(self, unpack(args))
+    end)
+
+    mt.__index = newcclosure(function(t, k)
+        if Settings.Enabled and t == Mouse and PredictedPosition then
+            if k == "Hit" then
+                return CFrame.new(PredictedPosition)
+            end
+            if k == "Target" then
+                return nil
+            end
+        end
+        return oldIndex(t, k)
+    end)
+
+    setreadonly(mt, true)
+end
+
+-- ==================== PUBLIC API ====================
+function SoruAutoAim:Enable(state)
+    Settings.Enabled = state
+    if state then
+        startLoop()
+        installHooks()
+    else
+        stopLoop()
+    end
+end
+
+function SoruAutoAim:SetRange(value)
+    Settings.Range = value
+end
+
+function SoruAutoAim:SetAimMode(mode)
+    Settings.AimMode = mode
+end
+
+function SoruAutoAim:SetFOVType(mode)
+    Settings.FOVType = mode
+end
+
+function SoruAutoAim:SetFOVRadius(value)
+    Settings.FOVRadius = value
+end
+
+function SoruAutoAim:SetPriority(priority)
+    Settings.Priority = priority
+end
+
+function SoruAutoAim:SetShowFOV(state)
+    Settings.ShowFOV = state
+end
+
+function SoruAutoAim:GetTarget()
+    return CurrentTarget
+end
+
+function SoruAutoAim:GetPredictedPosition()
+    return PredictedPosition
+end
+
+-- ==================== EXAMPLE USAGE ====================
+--[[
+-- Enable
+SoruAutoAim:Enable(true)
+
+-- Change settings
+SoruAutoAim:SetRange(350)
+SoruAutoAim:SetAimMode("FOV")
+SoruAutoAim:SetFOVType("V1")
+SoruAutoAim:SetFOVRadius(120)
+SoruAutoAim:SetPriority("Nearest")
+SoruAutoAim:SetShowFOV(true)
+]]
+
+return SoruAutoAim
